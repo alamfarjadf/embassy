@@ -67,17 +67,20 @@
 //! // Configure and trigger a transfer...
 //! ```
 
+#![allow(dead_code)]
+
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::{NonNull, addr_of_mut};
-use core::sync::atomic::{AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
 use core::task::{Context, Poll};
 
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 
-use crate::clocks::Gate;
+use crate::clocks::enable_and_reset;
+use crate::clocks::periph_helpers::NoConfig;
 use crate::dma::sealed::SealedChannel;
 use crate::pac::dma::vals::Halt;
 use crate::pac::edma_0_tcd::regs::{TcdAttr, TcdBiterElinkno, TcdCiterElinkno, TcdCsr};
@@ -92,20 +95,17 @@ use crate::peripherals::DMA0;
 /// The function enables the DMA0 clock, releases reset, and configures the controller
 /// for normal operation with round-robin arbitration.
 pub(crate) fn init() {
-    unsafe {
-        // Enable DMA0 clock and release reset
-        DMA0::enable_clock();
-        DMA0::release_reset();
+    // Enable DMA0 clock and release reset
+    let _ = unsafe { enable_and_reset::<DMA0>(&NoConfig) };
 
-        // Configure DMA controller
-        pac::DMA0.mp_csr().modify(|w| {
-            w.set_edbg(true);
-            w.set_erca(true);
-            w.set_halt(Halt::NORMAL_OPERATION);
-            w.set_gclc(true);
-            w.set_gmrc(true);
-        });
-    }
+    // Configure DMA controller
+    pac::DMA0.mp_csr().modify(|w| {
+        w.set_edbg(true);
+        w.set_erca(true);
+        w.set_halt(Halt::NORMAL_OPERATION);
+        w.set_gclc(true);
+        w.set_gmrc(true);
+    });
 }
 
 // ============================================================================
@@ -371,8 +371,19 @@ pub(crate) enum DmaRequest {
 }
 
 impl DmaRequest {
-    pub fn number(self) -> u8 {
+    /// Convert enumerated value into a raw integer
+    pub const fn number(self) -> u8 {
         self as u8
+    }
+
+    /// Convert a raw integer into an enumerated value
+    ///
+    /// ## SAFETY
+    ///
+    /// The given number MUST be one of the defined variant, e.g. a number
+    /// derived from [`Self::number()`], otherwise it is immediate undefined behavior.
+    pub unsafe fn from_number_unchecked(num: u8) -> Self {
+        unsafe { core::mem::transmute(num) }
     }
 }
 
@@ -546,6 +557,30 @@ impl DmaChannel<'_> {
     pub(crate) fn tcd(&self) -> pac::edma_0_tcd::Tcd {
         // Safety: MCXA276 has a single eDMA instance
         pac::EDMA_0_TCD0.tcd(self.channel.index())
+    }
+
+    /// set a manual callback to be called AFTER the DMA interrupt is processed. Will be called in the DMA interrupt
+    /// context.
+    ///
+    /// SAFETY: This must only be called on an owned DmaChannel, as there is only a single
+    /// callback slot, and calling this will invalidate any previously set callbacks.
+    pub(crate) unsafe fn set_callback(&mut self, f: fn()) {
+        // See https://doc.rust-lang.org/std/primitive.fn.html#casting-to-and-from-integers
+        let cb = f as *mut ();
+        CALLBACKS[self.index()].store(cb, Ordering::Release);
+    }
+
+    /// Unset the callback, causing no method to be called after DMA completion.
+    ///
+    /// SAFETY: This must only be called on an owned DmaChannel, as there is only a single
+    /// callback slot, and calling this will invalidate any previously set callbacks.
+    pub(crate) unsafe fn clear_callback(&mut self) {
+        CALLBACKS[self.index()].store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// Access TCD DADDR field
+    pub(crate) fn daddr(&self) -> u32 {
+        self.tcd().tcd_daddr().read().daddr()
     }
 
     fn clear_tcd(t: &pac::edma_0_tcd::Tcd) {
@@ -2194,6 +2229,12 @@ impl<'channel, 'buf, W: Word> RingBuffer<'channel, 'buf, W> {
     /// Call this to start continuous reception.
     /// This is separated from setup to allow for any additional configuration
     /// before starting the transfer.
+    ///
+    /// ## SAFETY
+    ///
+    /// The Dma Channel must have been setup with proper manual configuration prior to
+    /// calling `enable_dma_request`. See safety requirements of the configuration methods
+    /// for more details.
     pub unsafe fn enable_dma_request(&self) {
         unsafe {
             self.channel.enable_request();
@@ -2565,8 +2606,17 @@ macro_rules! impl_dma_interrupt_handler {
     ($irq:ident, $ch:expr) => {
         #[interrupt]
         fn $irq() {
+            // SAFETY: The correct $ch is called as generated, We check that
+            // the given callback is non-null before calling.
             unsafe {
                 on_interrupt($ch);
+
+                // See https://doc.rust-lang.org/std/primitive.fn.html#casting-to-and-from-integers
+                let cb: *mut () = CALLBACKS[$ch].load(Ordering::Acquire);
+                if cb != core::ptr::null_mut() {
+                    let cb: fn() = core::mem::transmute(cb);
+                    (cb)();
+                }
             }
         }
     };
@@ -2582,3 +2632,8 @@ impl_dma_interrupt_handler!(DMA_CH4, 4);
 impl_dma_interrupt_handler!(DMA_CH5, 5);
 impl_dma_interrupt_handler!(DMA_CH6, 6);
 impl_dma_interrupt_handler!(DMA_CH7, 7);
+
+// TODO(AJM): This is a gross, gross hack. This implements optional callbacks
+// for DMA completion interrupts. This should go away once we switch to
+// "in-band" DMA interrupt binding with `bind_interrupts!`.
+static CALLBACKS: [AtomicPtr<()>; 8] = [const { AtomicPtr::new(core::ptr::null_mut()) }; 8];

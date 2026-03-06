@@ -158,6 +158,8 @@ define_counters!(
     interrupt_gpio3_wake,
     interrupt_gpio4,
     interrupt_gpio4_wake,
+    interrupt_gpio5,
+    interrupt_gpio5_wake,
     interrupt_i2c0,
     interrupt_i2c0_wake,
     interrupt_i2c1,
@@ -188,8 +190,8 @@ define_counters!(
     interrupt_spi0_wake,
     interrupt_spi1,
     interrupt_spi1_wake,
-    interrupt_trng,
-    interrupt_trng_wake,
+    interrupt_trng0,
+    interrupt_trng0_wake,
     interrupt_wwdt,
     wfe_sleeps
 );
